@@ -1,0 +1,239 @@
+name: Build GrapheneOS (topaz)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Build variant
+        type: choice
+        options: [userdebug, user, eng]
+        default: userdebug
+      target:
+        description: make target (otapackage = flashable zip plus all images)
+        default: otapackage
+      wait_for_fix:
+        description: On failure, keep the tree and wait for a pushed fix instead of exiting
+        type: boolean
+        default: true
+      chain_left:
+        description: Runs to start one after another while the build keeps stopping at the time budget (0 = this run only)
+        type: number
+        default: 12
+
+permissions:
+  contents: write
+  # Start the next run when this one stops at the time budget
+  actions: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # GrapheneOS release tag (Android 17, android-17.0.0_r1 base; crDroid 17 /
+  # LineageOS 24.0 trees for topaz are on the same AOSP version)
+  GOS_TAG: "2026110200"
+  DEVICE: topaz
+  PRODUCT: topaz
+  # GrapheneOS lunch release (alias of cp2a): lunch topaz-cur-<variant>
+  RELEASE: cur
+  # GitHub kills the job at 360 min; leave room to save ccache + upload.
+  JOB_BUDGET_MIN: 335
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Record start time
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Remove preinstalled software
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/local/share/powershell /usr/share/swift /usr/local/.ghcup \
+            /usr/lib/jvm /opt/microsoft /opt/google /usr/local/julia* /usr/share/miniconda \
+            /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/vcpkg /usr/local/n \
+            /usr/local/aws-cli /usr/local/aws-sam-cli /opt/az /opt/pipx /opt/mssql-tools \
+            /usr/lib/google-cloud-sdk /usr/lib/mono /usr/lib/heroku /usr/lib/llvm-* /usr/lib/firefox \
+            /usr/share/gradle* /usr/share/apache-maven* /usr/share/kotlinc /usr/share/sbt \
+            /home/runner/.rustup /home/runner/.cargo /var/lib/gems || true
+          sudo docker image prune -a -f || true
+          sudo swapoff -a && sudo rm -f /mnt/swapfile /swapfile || true
+          df -h
+
+      - name: Prepare build dir and swap
+        run: |
+          sudo mkdir -p /build && sudo chown "$USER:$USER" /build
+          # Prefer zram (costs no disk) with a small disk swap as overflow.
+          swap=8G
+          if sudo modprobe zram 2>/dev/null || { sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe zram; }; then
+            echo zstd | sudo tee /sys/block/zram0/comp_algorithm
+            # Soong's heap compresses well, so 20G of zram holds far more than it costs in RAM
+            echo 20G | sudo tee /sys/block/zram0/disksize
+            sudo mkswap /dev/zram0 && sudo swapon -p 100 /dev/zram0
+            swap=5G
+          else
+            echo "::warning::zram unavailable, using a ${swap} swap file only"
+          fi
+          sudo fallocate -l "$swap" /swapfile && sudo chmod 600 /swapfile
+          sudo mkswap /swapfile && sudo swapon -p 10 /swapfile
+          # The source tree (~85G) goes on a zstd-compressed btrfs volume too:
+          # on the plain disk it left too little room for out/ to finish packaging.
+          mkdir -p /build/src
+          if { command -v mkfs.btrfs > /dev/null || sudo apt-get install -y -qq btrfs-progs btrfs-compsize > /dev/null; } &&
+             truncate -s 300G /build/src.img && mkfs.btrfs -q -f -m single /build/src.img &&
+             sudo mount -o loop,compress-force=zstd:3,noatime,discard=async /build/src.img /build/src; then
+            sudo chown "$USER:$USER" /build/src
+          else
+            echo "::warning::Could not set up a compressed volume for the source tree, using the plain disk"
+            rm -f /build/src.img
+          fi
+          df -h; free -h; nproc
+
+      - name: Checkout local manifests
+        uses: actions/checkout@v4
+        with:
+          path: manifests
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3 protobuf-compiler python3-protobuf
+          sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git config --global color.ui false
+          git lfs install
+
+      - name: Start resource monitor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          nohup bash -c 'while true; do echo "== $(date -u +%T) load=$(cut -d" " -f1-3 /proc/loadavg)"; free -m | sed -n 2,3p; df -m / /build | tail -2; sleep 60; done' > /build/monitor.log 2>&1 &
+          # Live view on the ci-live branch, so a runner that dies still leaves a trace
+          nohup "$GITHUB_WORKSPACE/manifests/ci/live.sh" > /dev/null 2>&1 &
+
+      - name: Init and sync sources
+        working-directory: /build
+        env:
+          # ci/sync.sh pins sources to the saved out/ state, read with ci/state.sh
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p src && cd src
+          repo init -u https://github.com/GrapheneOS/platform_manifest -b "refs/tags/$GOS_TAG" \
+            --git-lfs --depth=1 --no-clone-bundle -g default,-mips,-darwin,-notdefault
+          mkdir -p .repo/local_manifests
+          cp "$GITHUB_WORKSPACE/manifests/local_manifests.xml" .repo/local_manifests/
+          cp "$GITHUB_WORKSPACE/manifests/ci/remove_unneeded.xml" .repo/local_manifests/
+          rc=0
+          "$GITHUB_WORKSPACE/manifests/ci/sync.sh" || rc=$?
+          # Unused clang versions are pruned by ci/build.sh, which also knows the
+          # release-config clang (pruning that here made it re-sync the whole project).
+          du -sh .repo 2>/dev/null; du -sh -- */ 2>/dev/null | sort -rh | head -15
+          du -sh prebuilts/*/ external/*/ 2>/dev/null | sort -rh | head -25
+          tail -3 /build/monitor.log
+          df -h /build
+          exit $rc
+
+      - name: Build
+        id: build
+        working-directory: /build/src
+        env:
+          # Keep the ccache prefix so compile commands match the saved out/
+          # (a changed command line makes ninja rebuild), but cache nothing:
+          # out/ itself is carried between runs and the disk is needed.
+          USE_CCACHE: 1
+          CCACHE_EXEC: /usr/bin/ccache
+          CCACHE_DIR: /build/ccache
+          CCACHE_DISABLE: 1
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -3 /build/monitor.log
+          # Pick up fixes pushed while syncing; copy so later pushes can't change the script mid-run.
+          git -C "$GITHUB_WORKSPACE/manifests" pull -q --ff-only || true
+          cp "$GITHUB_WORKSPACE/manifests/local_manifests.xml" .repo/local_manifests/
+          cp "$GITHUB_WORKSPACE/manifests/ci/build.sh" /build/ci-build.sh
+          rc=0
+          PRODUCT="$PRODUCT" RELEASE="$RELEASE" VARIANT="${{ inputs.variant }}" TARGET="${{ inputs.target }}" WAIT_FOR_FIX="${{ inputs.wait_for_fix }}" \
+            MANIFESTS_DIR="$GITHUB_WORKSPACE/manifests" /build/ci-build.sh || rc=$?
+          df -h /build; free -h
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            /build/build.log
+            /build/build-attempt*.log
+            /build/monitor.log
+            /build/src/out/error.log
+            /build/src/out/soong.log
+          if-no-files-found: ignore
+
+      # A run that stopped at the time budget saved out/; carry on in a new run
+      # (queued behind this one by the concurrency group) until the build
+      # finishes. Stops on a real build error, a failed save, a full disk or
+      # too little progress, so a broken build does not loop.
+      - name: Start the next run
+        if: ${{ !cancelled() && steps.build.outputs.rc != '' && steps.build.outputs.rc != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC: ${{ steps.build.outputs.rc }}
+          STATE: ${{ steps.build.outputs.state }}
+          NINJA_MIN: ${{ steps.build.outputs.ninja_min }}
+          PROGRESS: ${{ steps.build.outputs.progress }}
+          DISK_STOP: ${{ steps.build.outputs.disk_stop }}
+          CHAIN_LEFT: ${{ inputs.chain_left }}
+        run: |
+          echo "rc=$RC state=$STATE ninja=${NINJA_MIN}m last progress: $PROGRESS chain_left=$CHAIN_LEFT"
+          chain=${CHAIN_LEFT%.*}; chain=${chain:-0}
+          why=
+          [ "$DISK_STOP" = true ] && why="the disk filled up; the next run would stop at the same point"
+          [ -z "$why" ] && case $RC in 124|130) ;; *) why="the build failed (rc $RC), it was not a time-budget stop" ;; esac
+          [ -z "$why" ] && [ "$STATE" != saved ] && why="out/ was not saved (${STATE:-unknown})"
+          [ -z "$why" ] && [ "${NINJA_MIN:-0}" -lt 20 ] && why="ninja ran only ${NINJA_MIN:-0} min, too little progress"
+          [ -z "$why" ] && [ "$chain" -le 0 ] && why="chain_left is 0"
+          if [ -n "$why" ]; then
+            echo "::warning::Not starting another run: $why"
+            exit 0
+          fi
+          next=$((chain - 1))
+          gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f variant="${{ inputs.variant }}" -f target="${{ inputs.target }}" \
+            -f wait_for_fix="${{ inputs.wait_for_fix }}" -f chain_left="$next"
+          echo "::notice::Started the next run (chain_left=$next); it waits for this one to finish."
+
+      - name: Publish ROM to a release
+        if: success()
+        working-directory: /build/src/out/target/product/${{ env.DEVICE }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip=$(ls -t "$PRODUCT"-ota*.zip 2>/dev/null | head -1)
+          [ -n "$zip" ] || { echo "::error::No OTA zip in $PWD"; ls; exit 1; }
+          out="GrapheneOS-${GOS_TAG}-${DEVICE}-unofficial-$(date +%Y%m%d)-${{ inputs.variant }}.zip"
+          mv "$zip" "$out"
+          files=("$out")
+          for img in boot.img init_boot.img vendor_boot.img dtbo.img recovery.img vbmeta.img; do [ -f "$img" ] && files+=("$img"); done
+          sha256sum "${files[@]}" > SHA256SUMS
+          files+=(SHA256SUMS)
+          tag="${DEVICE}-$(date +%Y%m%d)-${{ github.run_number }}"
+          gh release create "$tag" "${files[@]}" -R "$GITHUB_REPOSITORY" \
+            --title "GrapheneOS $GOS_TAG (unofficial) $DEVICE $(date +%Y-%m-%d)" \
+            --notes "Unofficial GrapheneOS $GOS_TAG port (${{ inputs.variant }}, test keys). Bootloader stays UNLOCKED: never relock it on this Xiaomi. Built by run ${{ github.run_id }}. Flash the zip from recovery (adb sideload) after a format data."
+
+      - name: Drop the saved out/ state
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # ci/sync.sh pins sources to the saved state; once the ROM is out the
+        # next build should start from the latest sources.
+        run: gh release delete ci-out-state -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true

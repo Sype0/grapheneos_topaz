@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Unofficial GrapheneOS (tag in .github/workflows/build.yml, Android 17) for the
+  Redmi Note 12 4G (topaz/tapas). On top of GrapheneOS's own manifest this adds
+  the device trees and the CAF/QCOM hardware projects the vendor side needs
+  (LineageOS 24.0 branches, as crDroid 17 uses), nothing from vendor/lineage.
+-->
+<manifest>
+
+    <remote name="gh" fetch="https://github.com/" />
+    <remote name="aosp-r" fetch="https://android.googlesource.com/" />
+
+    <!-- GrapheneOS projects replaced for this device -->
+    <!-- hardened_malloc: 2GiB class regions for the kernel's 39-bit address space -->
+    <remove-project path="external/hardened_malloc" />
+    <project name="Sype0/hardened_malloc" path="external/hardened_malloc" remote="gh" revision="topaz-17" />
+    <!-- bionic: scudo for the Qualcomm/Xiaomi vendor blobs, hardened_malloc for the rest -->
+    <remove-project path="bionic" />
+    <project name="Sype0/platform_bionic" path="bionic" remote="gh" revision="topaz-17" />
+    <!-- SetupWizard2: never asks to relock the bootloader or turn off OEM unlocking -->
+    <remove-project path="packages/apps/SetupWizard2" />
+    <project name="Sype0/platform_packages_apps_SetupWizard2" path="packages/apps/SetupWizard2" remote="gh" revision="topaz-17" />
+
+    <!-- Device trees -->
+    <project name="Sype0/android_device_xiaomi_topaz" path="device/xiaomi/topaz" remote="gh" revision="grapheneos-17" />
+    <project name="Sype0/android_vendor_xiaomi_topaz" path="vendor/xiaomi/topaz" remote="gh" revision="crdroid-17.0" />
+    <!-- BaranAspect's prebuilt kernel (lineage-23.0) plus the header modules AOSP lacks -->
+    <project name="Sype0/android_kernel_xiaomi_topaz" path="device/xiaomi/topaz-kernel" remote="gh" revision="aosp-16" />
+
+    <!-- SEPolicy -->
+    <project name="LineageOS/android_device_qcom_sepolicy" path="device/qcom/sepolicy" remote="gh" revision="lineage-24.0" />
+    <project name="Sype0/android_device_qcom_sepolicy_vndr_sm6225" path="device/qcom/sepolicy_vndr/sm6225" remote="gh" revision="crdroid-17.0" />
+    <project name="Sype0/android_device_xiaomi_sepolicy" path="device/xiaomi/sepolicy" remote="gh" revision="crdroid-17.0" />
+
+    <!-- AOSP's own copy would clash with hardware/qcom-caf/wlan -->
+    <remove-project path="hardware/qcom/wlan" />
+
+    <!-- QCOM common hardware -->
+    <project name="Sype0/android_hardware_qcom-caf_common" path="hardware/qcom-caf/common" remote="gh" revision="grapheneos-17" >
+        <!-- Keep make from descending into hardware/qcom; select the sm6225 tree as its own Soong namespace -->
+        <linkfile src="os_pickup_aosp.mk" dest="hardware/qcom/Android.mk" />
+        <linkfile src="os_pickup_sepolicy_vndr.mk" dest="device/qcom/sepolicy_vndr/SEPolicy.mk" />
+        <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm6225/Android.bp" />
+    </project>
+    <project name="LineageOS/android_hardware_qcom_bootctrl" path="hardware/qcom-caf/bootctrl" remote="gh" revision="lineage-24.0-caf" />
+    <project name="LineageOS/android_hardware_qcom_thermal" path="hardware/qcom-caf/thermal" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_hardware_qcom_wlan" path="hardware/qcom-caf/wlan" remote="gh" revision="lineage-24.0-caf" />
+
+    <project name="LineageOS/android_vendor_qcom_opensource_audio-commonsys-intf" path="vendor/qcom/opensource/commonsys-intf/audio" remote="gh" revision="lineage-24.0" />
+    <!-- Gralloc handle layout in a header instead of LineageOS-only export_cflags -->
+    <project name="Sype0/android_vendor_qcom_opensource_display-commonsys-intf" path="vendor/qcom/opensource/commonsys-intf/display" remote="gh" revision="grapheneos-17" />
+    <project name="LineageOS/android_vendor_qcom_opensource_audio" path="vendor/qcom/opensource/commonsys/audio" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_display-commonsys" path="vendor/qcom/opensource/commonsys/display" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_core-utils-sys" path="vendor/qcom/opensource/core-utils-sys" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_core-utils-vendor" path="vendor/qcom/opensource/core-utils-vendor" remote="gh" revision="lineage-24.0" />
+    <!-- Not built for bengal, but the sm6225 namespace imports it and Soong needs it to exist -->
+    <project name="LineageOS/android_vendor_qcom_opensource_display" path="vendor/qcom/opensource/display" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_dataservices" path="vendor/qcom/opensource/dataservices" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_healthd-ext" path="vendor/qcom/opensource/healthd-ext" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_interfaces" path="vendor/qcom/opensource/interfaces" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_libvmmem" path="vendor/qcom/opensource/libvmmem" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_power" path="vendor/qcom/opensource/power" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_vendor_qcom_opensource_usb" path="vendor/qcom/opensource/usb" remote="gh" revision="lineage-24.0" />
+    <!-- Exact LDO driver match: the 50 ms clamp stretched every haptic tick on topaz -->
+    <project name="Sype0/android_vendor_qcom_opensource_vibrator" path="vendor/qcom/opensource/vibrator" remote="gh" revision="crdroid-17.0" />
+    <project name="LineageOS/android_vendor_codeaurora_telephony" path="vendor/codeaurora/telephony" remote="gh" revision="lineage-24.0" />
+
+    <!-- Libraries the blobs and HALs link against -->
+    <project name="LineageOS/android_external_json-c" path="external/json-c" remote="gh" revision="lineage-24.0" />
+    <project name="LineageOS/android_external_ant-wireless_hidl" path="external/ant-wireless/hidl" remote="gh" revision="lineage-24.0" />
+    <project name="platform/external/tinyxml" path="external/tinyxml" remote="aosp-r" revision="refs/tags/android-11.0.0_r46" />
+    <!-- Vendor compat shims (libbase_shim, libprocessgroup_shim, ...), minus AOSP's own protobuf 21.12 -->
+    <project name="Sype0/android_hardware_lineage_compat" path="hardware/lineage/compat" remote="gh" revision="grapheneos-17" />
+    <project name="LineageOS/android_hardware_xiaomi" path="hardware/xiaomi" remote="gh" revision="lineage-24.0" />
+
+    <!-- SM6225 CAF trees -->
+    <project path="hardware/qcom-caf/sm6225/audio/agm" name="rn124g-development/android_hardware_qcom-caf_sm6225_audio_agm" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/audio/pal" name="rn124g-development/android_hardware_qcom-caf_sm6225_audio_pal" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/audio/primary-hal" name="rn124g-development/android_hardware_qcom-caf_sm6225_audio_primary-hal" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/dataipa" name="rn124g-development/android_hardware_qcom-caf_sm6225_dataipa" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/data-ipa-cfg-mgr" name="rn124g-development/android_hardware_qcom-caf_sm6225_data-ipa-cfg-mgr" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/display" name="rn124g-development/android_hardware_qcom-caf_sm6225_display" remote="gh" revision="sixteen" />
+    <project path="hardware/qcom-caf/sm6225/media" name="rn124g-development/android_hardware_qcom-caf_sm6225_media" remote="gh" revision="sixteen" />
+
+</manifest>

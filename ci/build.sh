@@ -1,0 +1,339 @@
+#!/bin/bash
+# Build; when an attempt fails, keep the synced tree and wait for a fix pushed to
+# this repo or to any project in local_manifests.xml, re-sync only what changed,
+# then build again. Stops at the job time budget.
+# Run from the top of the source tree. Needs JOB_START, JOB_BUDGET_MIN, DEVICE,
+# VARIANT, TARGET, WAIT_FOR_FIX, MANIFESTS_DIR (PRODUCT, RELEASE optional).
+set -u
+
+# Stop building early enough to save out/ for the next run (ci/state.sh).
+SAVE_MIN=${SAVE_MIN:-45}
+deadline=$(( JOB_START + (JOB_BUDGET_MIN - SAVE_MIN) * 60 ))
+minutes_left() { echo $(( (deadline - $(date +%s)) / 60 )); }
+manifest_head() { git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/heads/$GITHUB_REF_NAME" | cut -f1; }
+
+# "<path> <url> <sha>" for every project in local_manifests.xml
+project_heads() {
+    python3 - "$MANIFESTS_DIR/local_manifests.xml" <<'PY' |
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+remotes = {r.get("name"): r.get("fetch").rstrip("/") for r in root.iter("remote")}
+for p in root.iter("project"):
+    print(p.get("path"), f'{remotes[p.get("remote")]}/{p.get("name")}', p.get("revision"))
+PY
+    while read -r path url rev; do
+        echo "$path $url $(git ls-remote "$url" "refs/heads/$rev" | cut -f1)"
+    done
+}
+
+# "<path> <hash of the project's manifest entry>": catches linkfile/copyfile
+# edits that leave the revision alone
+project_entries() {
+    python3 - "$MANIFESTS_DIR/local_manifests.xml" <<'PY'
+import hashlib, sys, xml.etree.ElementTree as ET
+for p in ET.parse(sys.argv[1]).getroot().iter("project"):
+    print(p.get("path"), hashlib.sha1(ET.tostring(p)).hexdigest())
+PY
+}
+
+# Publish the failure to the ci-status branch so it can be read while the job waits.
+publish_status() {
+    local dir=/tmp/ci-status
+    rm -rf "$dir" && mkdir -p "$dir" && cd "$dir" || return
+    git init -q && git checkout -q -b ci-status
+    {
+        echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        echo "attempt: $1  rc: $2  state: $3  time: $(date -u +%FT%TZ)  minutes_left: $(minutes_left)"
+        df -h /build | tail -1
+        mountpoint -q /build/src && df -h /build/src | tail -1
+        mountpoint -q /build/src/out && { df -h /build/src/out | tail -1; sudo compsize -x /build/src/out 2>/dev/null | tail -3; }
+        echo "---- preparation ----"
+        tail -25 /build/prep.log 2>/dev/null
+        echo "---- errors ----"
+        grep -nE -A6 'error:|FAILED:|ERROR:|Error:|fatal:' /build/build.log | grep -v '^\[ *[0-9]*% ' | head -300
+        echo "---- tail ----"
+        tail -80 /build/build.log
+    } > status.txt
+    git add status.txt && git -c user.name=ci -c user.email=ci@localhost commit -qm "attempt $1: $3"
+    git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY" ci-status
+    cd - > /dev/null
+}
+
+wait_for_fix() {
+    local old_manifest=$1 now_manifest
+    echo "::warning::Build failed. Waiting for a fix to be pushed ($(minutes_left)m left; cancel the run to stop)."
+    while [ "$(minutes_left)" -gt 20 ]; do
+        sleep 60
+        now_manifest=$(manifest_head)
+        if [ -n "$now_manifest" ] && [ "$now_manifest" != "$old_manifest" ]; then
+            git -C "$MANIFESTS_DIR" fetch -q origin "$GITHUB_REF_NAME" && git -C "$MANIFESTS_DIR" reset -q --hard FETCH_HEAD
+            return 0
+        fi
+        project_heads > /tmp/heads.new
+        cmp -s /tmp/heads.old /tmp/heads.new || return 0
+    done
+    return 1
+}
+
+resync_changed() {
+    cp "$MANIFESTS_DIR/local_manifests.xml" "$MANIFESTS_DIR/ci/remove_unneeded.xml" .repo/local_manifests/
+    project_heads > /tmp/heads.new
+    local changed
+    project_entries > /tmp/entries.new
+    changed=$( { diff /tmp/heads.old /tmp/heads.new; diff /tmp/entries.old /tmp/entries.new; } |
+        sed -n 's/^> \([^ ]*\) .*/\1/p' | sort -u)
+    echo "Re-syncing: ${changed:-nothing}"
+    # repo itself breaks with the build-manifest shim in place
+    [ -e .repo/repo/repo.real ] && mv -f .repo/repo/repo.real .repo/repo/repo
+    for path in $changed; do
+        rm -rf "$path" ".repo/projects/$path.git"
+        repo sync -c --force-sync --no-clone-bundle --no-tags "$path" < /dev/null || return 1
+    done
+    mv /tmp/heads.new /tmp/heads.old
+    mv /tmp/entries.new /tmp/entries.old
+}
+
+# Delete toolchain versions the build does not use (several GB each), plus a few
+# large test-only trees. Missing test deps are tolerated via ALLOW_MISSING_DEPENDENCIES.
+# Soong's analysis needs far more than the 16 GB of RAM; without the disk swap
+# file the runner gets killed. Put it back if it was dropped and there is room.
+ensure_disk_swap() {
+    local avail
+    avail=$(df -BM --output=avail / | tail -1 | tr -dc 0-9)
+    if ! swapon --show=NAME --noheadings | grep -qx /swapfile && [ "${avail:-0}" -ge 8192 ]; then
+        echo "Re-creating the disk swap file for the analysis"
+        sudo fallocate -l 5G /swapfile && sudo chmod 600 /swapfile && sudo mkswap -q /swapfile && sudo swapon -p 10 /swapfile
+        avail=$(df -BM --output=avail / | tail -1 | tr -dc 0-9)
+    fi
+    # The analysis peaks well above RAM + zram (crDroid 17 went past
+    # 16 GB RAM + 37 GB swap); add as much as the disk allows, keeping 8 GB free
+    local size=$(( ${avail:-0} - 8192 ))
+    [ "$size" -gt 24576 ] && size=24576
+    if ! swapon --show=NAME --noheadings | grep -qx /swapfile2 && [ "$size" -ge 2048 ]; then
+        echo "Adding a ${size}M second swap file for the analysis (${avail}M free)"
+        sudo fallocate -l "${size}M" /swapfile2 && sudo chmod 600 /swapfile2 && sudo mkswap -q /swapfile2 && sudo swapon -p 10 /swapfile2
+    fi
+    swapon --show
+}
+
+# out/ grows every run, leaving less disk for swap, and once RAM + swap run out
+# the runner dies without saving out/. A Go memory limit makes soong_build
+# collect garbage harder near that point instead. soong_ui starts the
+# bootstrap ninja with only TOP and PATH set, so pass it through a wrapper.
+limit_soong_memory() {
+    local nb=prebuilts/build-tools/linux-x86/bin/ninja mem swap lim
+    [ -e "$nb.real" ] || mv "$nb" "$nb.real" || return
+    mem=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+    swap=$(awk '/^SwapTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+    # Leave room for the compressed zram pages and everything else
+    lim=$(( mem + swap - 12288 ))
+    printf '#!/bin/sh\nGOMEMLIMIT=%sMiB exec %s "$@"\n' "$lim" "$PWD/$nb.real" > "$nb"
+    chmod 755 "$nb"
+    echo "soong_build memory limit: ${lim}M (RAM ${mem}M + swap ${swap}M)"
+}
+
+prune_tree() {
+    local default keep d v base clang=prebuilts/clang/host/linux-x86
+    # Default clang: ClangDefaultVersion up to Android 16, the
+    # RELEASE_BUILD_CLANG_VERSION release flag from Android 17 on.
+    default=$( { sed -n 's/.*ClangDefaultVersion *= *"\(clang-[^"]*\)".*/\1/p' build/soong/cc/config/global.go
+                 grep -rl --include=RELEASE_BUILD_CLANG_VERSION.textproto . build/release vendor/*/release 2>/dev/null |
+                     xargs -r grep -hoE '"clang-r[0-9]+[a-z]?"' | tr -d '"'; } | sort -u)
+    # Without the default, pruning would delete the compiler the build uses.
+    [ -n "$default" ] || { echo "::warning::Default clang version not found, not pruning $clang"; }
+    # Plus any other version the build system pins (e.g. bindgen's).
+    keep=$( { echo "$default"
+              [ -n "$default" ] && grep -rhoE '"clang-r[0-9]+[a-z]?"' build/soong/rust/config build/soong/rust/bindgen.go | tr -d '"'; } |
+            sed '/^$/d' | sort -u)
+    # The tree is freshly synced and nothing prunes before this point, so a
+    # missing version is simply not in this clang revision: release configs
+    # that are not selected name clangs too. (Re-syncing cost 12 min a run.)
+    for v in $keep; do
+        [ -d "$clang/$v" ] || echo "$clang/$v is not in the synced tree, assuming it is unused"
+    done
+    if [ -n "$keep" ]; then
+        for d in "$clang"/clang-r*; do
+            [ -L "$d" ] && continue
+            grep -qx "$(basename "$d")" <<< "$keep" && continue
+            # Keep anything a symlink (clang-stable, llvm-binutils-stable, ...) points into.
+            find "$clang" -maxdepth 1 -type l -exec readlink {} \; | grep -q "$(basename "$d")" && continue
+            echo "Pruning $d (keeping:" $keep")"; rm -rf "$d"
+        done
+    fi
+    # Rust: prebuilts/rust/ up to Android 16, RustDefaultBase (prebuilts/rust-toolchain/,
+    # ~13 GB with three versions per host) from Android 17 on.
+    v=$(sed -n 's/.*RustDefaultVersion *= *"\([0-9.]*\)".*/\1/p' build/soong/rust/config/global.go)
+    base=$(sed -n 's/.*RustDefaultBase *= *"\([^"]*\)".*/\1/p' build/soong/rust/config/global.go)
+    base=${base%/}
+    [ -n "$base" ] || base=prebuilts/rust
+    if [ -n "$v" ] && [ -d "$base/linux-x86/$v" ]; then
+        for d in "$base"/*/[0-9]*.[0-9]*; do
+            [ -L "$d" ] || [ "$(basename "$d")" = "$v" ] && continue
+            echo "Pruning $d (default is $v)"; rm -rf "$d"
+        done
+    else
+        echo "::warning::Rust $v not found in $base/linux-x86, not pruning $base"
+    fi
+    # Whole projects go in ci/remove_unneeded.xml instead, so they are not
+    # synced back. Not cts: system modules such as aconfigd-system use it.
+}
+
+# Put out/ on a zstd-compressed btrfs image (level 9: the restored out/ must fit
+# next to the tree): build output compresses 2-3x,
+# which is the only way it fits next to the source on the runner's disk.
+setup_compressed_out() {
+    mountpoint -q out && return 0
+    command -v mkfs.btrfs > /dev/null || sudo apt-get install -y -qq btrfs-progs btrfs-compsize > /dev/null || return 1
+    truncate -s 400G /build/out.img && mkfs.btrfs -q -f /build/out.img || return 1
+    [ -d out ] && mv out out.plain
+    mkdir -p out
+    if ! sudo mount -o loop,compress-force=zstd:9,noatime,discard=async /build/out.img out; then
+        rmdir out; [ -d out.plain ] && mv out.plain out; rm -f /build/out.img; return 1
+    fi
+    sudo chown "$(id -u):$(id -g)" out
+    if [ -d out.plain ]; then
+        echo "Moving existing out/ ($(du -sh out.plain | cut -f1)) onto the compressed volume"
+        cp -a out.plain/. out/ && rm -rf out.plain
+    fi
+}
+
+# The disk swap file is only needed for the memory-hungry analysis; zram stays.
+free_disk_swap() {
+    local f
+    # Packaging grows out/ by 10+ GB; that space matters more than swap now
+    for f in /swapfile2 /swapfile; do
+        swapon --show=NAME --noheadings | grep -qx "$f" || continue
+        echo "Analysis done, dropping $f"
+        sudo swapoff "$f" && sudo rm -f "$f"
+    done
+    df -h / | tail -1
+}
+
+exec 3>&1 4>&2
+exec > >(tee -a /build/prep.log) 2>&1
+echo "== preparation, attempt ${ATTEMPT:-1} $(date -u +%T)"
+# The real repo is needed while preparing (repo list/sync read their own
+# launcher), the shim only for the build itself
+[ -e .repo/repo/repo.real ] && mv -f .repo/repo/repo.real .repo/repo/repo
+prune_tree
+setup_compressed_out || echo "::warning::Could not set up compressed out/, continuing without it"
+# Keep room for packing out/ even when the build fills the disk.
+[ -f /build/ballast ] || fallocate -l 2500M /build/ballast
+if [ ! -f /tmp/state-restored ]; then
+    touch /tmp/state-restored
+    cp "$MANIFESTS_DIR/ci/state.sh" /build/ci-state.sh
+    /build/ci-state.sh restore
+fi
+df -h /build out | tail -2
+
+# Projects dropped from the CI manifest after the tree was synced still sit on disk.
+for path in $(sed -n 's/.*<remove-project path="\([^"]*\)".*/\1/p' "$MANIFESTS_DIR/ci/remove_unneeded.xml"); do
+    [ -e "$path" ] && { echo "Removing $path (dropped in ci/remove_unneeded.xml)"; rm -rf "$path"; }
+done
+
+# Projects added back to the manifest after the tree was synced are missing on disk.
+missing=$(repo list --all -p | while read -r path; do [ -e "$path" ] || echo "$path"; done)
+if [ -n "$missing" ]; then
+    echo "Syncing missing projects:" $missing
+    repo sync -c --force-sync --no-clone-bundle --no-tags $missing < /dev/null
+fi
+
+echo "cts present: $([ -d cts ] && echo yes || echo no)"
+exec 1>&3 2>&4 3>&- 4>&-
+
+[ -f /tmp/heads.old ] || project_heads > /tmp/heads.old
+[ -f /tmp/entries.old ] || project_entries > /tmp/entries.old
+attempt=${ATTEMPT:-1}
+while :; do
+    left=$(minutes_left)
+    [ "$left" -gt 5 ] || { rc=124; break; }
+    echo "=== Attempt $attempt, building for at most ${left}m"
+    (
+        set +u  # envsetup.sh is not nounset-clean
+        # Emulator/cuttlefish host tools reference prebuilts dropped in ci/remove_unneeded.xml.
+        export ALLOW_MISSING_DEPENDENCIES=true
+        # Siso (the default from Android 17 on) only writes its build state on a
+        # clean exit, and soong_ui kills it 3s after the time budget interrupt,
+        # so the next run rebuilt everything. Ninja logs every finished step.
+        export SOONG_NINJA=ninja
+        source build/envsetup.sh
+        lunch "${PRODUCT:-$DEVICE}-${RELEASE:-cur}-$VARIANT" || exit 1
+        # Analysis (Soong/Kati) first, while the disk swap file is there; the
+        # build after it needs the disk space more than the swap
+        ensure_disk_swap
+        limit_soong_memory
+        timeout --signal=INT --kill-after=2m "${left}m" m --skip-ninja "$TARGET" || exit $?
+        free_disk_swap
+        # The saved build outputs were left out for the analysis (ci/state.sh)
+        /build/ci-state.sh restore_bulk || exit 3
+        # A resumed out/ should leave little to do; show why ninja disagrees.
+        ls -l --time-style=full-iso out/.ninja_log out/.ninja_deps 2>&1
+        ninja_bin=prebuilts/build-tools/linux-x86/bin/ninja
+        combined=$(ls out/combined-*.ninja 2>/dev/null | head -1)
+        if [ -x "$ninja_bin" ] && [ -n "$combined" ]; then
+            timeout 10m "$ninja_bin" -f "$combined" -n -d explain "$TARGET" 2>&1 | grep -m 25 'ninja explain' || true
+        fi
+        # A full disk kills the runner before out/ can be saved: stop the build
+        # first, the interrupt is then saved like a timeout. Checked often, the
+        # compressed out/ volume can eat the last few GB within a minute.
+        ( while sleep 10; do
+            a=$(df -BM --output=avail / | tail -1 | tr -dc 0-9)
+            if [ "${a:-0}" -lt 3072 ]; then
+                echo "Only ${a}M left on the disk, stopping the build to save out/"
+                touch /build/disk-stop
+                pkill -INT -f soong_ui
+                break
+            fi
+        done ) &
+        guard=$!
+        start=$(date +%s)
+        timeout --signal=INT --kill-after=2m "$(minutes_left)m" m "$TARGET" -j"$(nproc)"
+        rc=$?
+        echo $(( ($(date +%s) - start) / 60 )) > /build/ninja-minutes
+        kill "$guard" 2>/dev/null
+        exit $rc
+    ) 2>&1 | tee /build/build.log
+    rc=${PIPESTATUS[0]}
+    df -h /build | tail -1
+    [ "$rc" = 0 ] && { publish_status "$attempt" 0 success; break; }
+    if [ -f /build/disk-stop ]; then
+        echo "::warning::Build stopped with the disk nearly full; saving out/."
+        break
+    fi
+    if [ "$rc" = 124 ] || [ "$rc" = 130 ]; then
+        echo "::warning::Build stopped at the time budget; saving out/ so the next run continues."
+        break
+    fi
+    cp /build/build.log "/build/build-attempt$attempt.log"
+    if [ "$WAIT_FOR_FIX" != true ]; then publish_status "$attempt" "$rc" failed; break; fi
+    publish_status "$attempt" "$rc" waiting-for-fix
+    head=$(manifest_head)
+    wait_for_fix "$head" || break
+    resync_changed || { publish_status "$attempt" "$rc" resync-failed; break; }
+    attempt=$((attempt + 1))
+    publish_status "$attempt" "" building
+    # Continue with the freshly pushed version of this script.
+    cp "$MANIFESTS_DIR/ci/build.sh" "/build/ci-build-$attempt.sh"
+    ATTEMPT=$attempt exec "/build/ci-build-$attempt.sh"
+done
+# For the workflow's decision to start the next run (build.yml)
+ninja_min=$(cat /build/ninja-minutes 2>/dev/null || echo 0)
+progress=$(grep -oE '^\[ *[0-9]+% [0-9]+/[0-9]+' /build/build.log 2>/dev/null | tail -1 | sed 's/^\[ *//')
+st=none
+if [ "$rc" != 0 ]; then
+    rm -f /build/ballast
+    publish_status "$attempt" "$rc" saving-state
+    if /build/ci-state.sh save; then st=state-saved; else st=state-save-failed; fi
+    # Free the disk so the ccache can still be saved.
+    mountpoint -q out && sudo umount out && rm -f /build/out.img
+    publish_status "$attempt" "$rc" "$st"
+fi
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    {
+        echo "state=${st#state-}"
+        echo "ninja_min=$ninja_min"
+        echo "progress=$progress"
+        echo "disk_stop=$([ -f /build/disk-stop ] && echo true || echo false)"
+    } >> "$GITHUB_OUTPUT"
+fi
+exit "$rc"

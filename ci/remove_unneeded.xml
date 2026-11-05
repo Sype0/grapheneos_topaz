@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- CI only: large projects topaz does not need, dropped to fit the GitHub runner disk. -->
+<!-- LineageOS drops these reference boards from its manifest as well -->
+<manifest>
+    <remove-project path="device/google/cuttlefish_prebuilts" />
+    <remove-project path="device/google/cuttlefish_vmm" />
+    <remove-project path="prebuilts/remoteexecution-client" />
+    <!-- Only used for ABI checks, not part of the ROM -->
+    <remove-project path="prebuilts/abi-dumps/ndk" />
+    <remove-project path="prebuilts/abi-dumps/platform" />
+    <remove-project path="prebuilts/abi-dumps/vndk" />
+    <!-- Only trusty/emulator host packages need it; tolerated by ALLOW_MISSING_DEPENDENCIES -->
+    <remove-project path="prebuilts/android-emulator" />
+    <remove-project path="external/chromiumos-config" />
+    <remove-project path="kernel/prebuilts/mainline/arm64" />
+    <remove-project path="kernel/prebuilts/mainline/x86_64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.1/arm64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.1/x86-64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.6/arm64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.6/x86-64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.12/arm64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.12/x86-64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/mainline/arm64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/mainline/x86-64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.18/arm64" />
+    <remove-project path="kernel/prebuilts/common-modules/virtual-device/6.18/x86-64" />
+    <!-- GrapheneOS: prebuilt Pixel kernels, only used by the adevtool-generated Pixel trees -->
+    <remove-project path="device/google/akita-kernels/6.1" />
+    <remove-project path="device/google/bluejay-kernels/6.1" />
+    <remove-project path="device/google/caimito-kernels/6.1" />
+    <remove-project path="device/google/comet-kernels/6.1" />
+    <remove-project path="device/google/felix-kernels/6.1" />
+    <remove-project path="device/google/laguna-kernels/6.18" />
+    <remove-project path="device/google/lynx-kernels/6.1" />
+    <remove-project path="device/google/pantah-kernels/6.1" />
+    <remove-project path="device/google/raviole-kernels/6.1" />
+    <remove-project path="device/google/shusky-kernels/6.1" />
+    <remove-project path="device/google/stallion-kernels/6.1" />
+    <remove-project path="device/google/tangorpro-kernels/6.1" />
+    <remove-project path="device/google/tegu-kernels/6.1" />
+    <remove-project path="device/amlogic/yukawa" />
+    <remove-project path="device/amlogic/yukawa-kernel" />
+    <remove-project path="device/linaro/dragonboard" />
+    <remove-project path="device/linaro/dragonboard-kernel" />
+    <remove-project path="device/linaro/hikey" />
+    <remove-project path="device/linaro/hikey-kernel" />
+</manifest>
