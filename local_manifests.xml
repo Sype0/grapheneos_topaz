@@ -25,7 +25,7 @@
     <project name="Sype0/android_device_xiaomi_topaz" path="device/xiaomi/topaz" remote="gh" revision="grapheneos-17" />
     <project name="Sype0/android_vendor_xiaomi_topaz" path="vendor/xiaomi/topaz" remote="gh" revision="crdroid-17.0" />
     <!-- BaranAspect's prebuilt kernel (lineage-23.0) plus the header modules AOSP lacks -->
-    <project name="Sype0/android_kernel_xiaomi_topaz" path="device/xiaomi/topaz-kernel" remote="gh" revision="aosp-16" />
+    <project name="Sype0/android_kernel_xiaomi_topaz" path="device/xiaomi/topaz-kernel" remote="gh" revision="grapheneos-17" />
 
     <!-- SEPolicy -->
     <project name="LineageOS/android_device_qcom_sepolicy" path="device/qcom/sepolicy" remote="gh" revision="lineage-24.0" />
