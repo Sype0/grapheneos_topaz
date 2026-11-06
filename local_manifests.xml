@@ -30,7 +30,7 @@
     <!-- SEPolicy -->
     <project name="LineageOS/android_device_qcom_sepolicy" path="device/qcom/sepolicy" remote="gh" revision="lineage-24.0" />
     <project name="Sype0/android_device_qcom_sepolicy_vndr_sm6225" path="device/qcom/sepolicy_vndr/sm6225" remote="gh" revision="crdroid-17.0" />
-    <project name="Sype0/android_device_xiaomi_sepolicy" path="device/xiaomi/sepolicy" remote="gh" revision="crdroid-17.0" />
+    <project name="Sype0/android_device_xiaomi_sepolicy" path="device/xiaomi/sepolicy" remote="gh" revision="grapheneos-17" />
 
     <!-- AOSP's own copy would clash with hardware/qcom-caf/wlan -->
     <remove-project path="hardware/qcom/wlan" />
